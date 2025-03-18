@@ -1,13 +1,20 @@
+# Use an official Python runtime as a parent image
 FROM python:3.9-slim
-WORKDIR /app
-COPY requirements.txt ./requirements.txt
-RUN apt-get update \
-    && apt-get -y install libpq-dev gcc \
-    && pip install psycopg2
-# Install uvicorn
-RUN pip install uvicorn
-# Install dependencies
-RUN pip install -r requirements.txt
-COPY . /app
-ENTRYPOINT ["uvicorn", "main:app"]
-CMD ["--host", "0.0.0.0", "--port", "7860"]
+
+# Set the working directory in the container
+WORKDIR /App
+
+# Copy the current directory contents into the container at /app
+COPY . /App
+
+# Install any needed packages specified in requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Make port 7860 available to the world outside this container
+EXPOSE 7860
+
+# Define environment variable
+ENV NAME=env
+
+# Run app.py when the container launches
+CMD ["python", "App.py"]

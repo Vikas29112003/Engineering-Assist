@@ -8,149 +8,154 @@ from langchain_community.vectorstores import MongoDBAtlasVectorSearch
 from langchain_groq import ChatGroq
 from langchain.chains import RetrievalQA
 from pymongo import MongoClient
-import gc
-import threading
-from functools import partial
+import tempfile
+import nltk
+import speech_recognition as sr
+import shutil
+
+
+nltk_data_path = "/tmp/nltk_data"
+os.makedirs(nltk_data_path, exist_ok=True)
+nltk.data.path.append(nltk_data_path)
+
+
+try:
+    
+    nltk.download('punkt', download_dir=nltk_data_path, quiet=True)
+    nltk.download('averaged_perceptron_tagger', download_dir=nltk_data_path, quiet=True)
+except Exception as e:
+    print(f"Failed to download NLTK data: {e}")
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "allow_headers": "*", "expose_headers": "*"}})
+MONGO_URL = os.environ["MONGO_URL"]
 
-# Environment variables
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-MONGO_URL = os.environ.get("MONGO_URL")
+collection_name = None
+temperature = 0
+db_name = "User"
+client = MongoClient(MONGO_URL)
+embeddings = HuggingFaceEmbeddings()
 
-if not GROQ_API_KEY or not MONGO_URL:
-    raise ValueError("Missing required environment variables")
-
-# Global variables with better memory management
-class AppState:
-    def __init__(self):
-        self.collection_name = None
-        self.temperature = 0
-        self.db_name = "User"
-        self._client = None
-        self._embeddings = None
-        self._llm = None
-        self.lock = threading.Lock()
-
-    @property
-    def client(self):
-        if self._client is None:
-            self._client = MongoClient(MONGO_URL)
-        return self._client
-
-    @property
-    def embeddings(self):
-        if self._embeddings is None:
-            self._embeddings = HuggingFaceEmbeddings()
-        return self._embeddings
-
-    @property
-    def llm(self):
-        if self._llm is None:
-            self._llm = ChatGroq(
-                model_name="llama-3.1-70b-versatile",
-                temperature=self.temperature,
-                groq_api_key=GROQ_API_KEY
-            )
-        return self._llm
-
-    def reset_llm(self):
-        self._llm = None
-
-state = AppState()
-
-def process_pdf_in_batches(file_path, batch_size=5):
-    """Process PDF documents in smaller batches to manage memory"""
-    loader = UnstructuredPDFLoader(file_path)
-    documents = loader.load()
-    text_splitter = CharacterTextSplitter(chunk_size=500, chunk_overlap=50)  # Reduced chunk size
-    texts = text_splitter.split_documents(documents)
-    
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        yield batch
-        gc.collect()  # Force garbage collection after each batch
+llm = ChatGroq(
+    model_name="llama-3.1-70b-versatile",
+    temperature=temperature,
+    groq_api_key=os.environ["GROQ_API_KEY"]
+)
 
 @app.route('/db_collection', methods=['POST'])
 def db_collection():
+    global collection_name
     data = request.json
     if not data or 'collection_name' not in data:
         return jsonify({'error': 'No collection_name provided'}), 400
-    
-    with state.lock:
-        state.collection_name = data['collection_name']
-    
-    return jsonify({'message': f'Database and collection set to {state.db_name} and {state.collection_name}'})
+    collection_name = data['collection_name']
+    return jsonify({'message': f'Database and collection set to {db_name} and {collection_name}'})
+
+
+@app.route('/voicetotext', methods=['POST'])
+def voicetotext():
+    file = request.files['audio']
+    if file.filename == '':
+        return jsonify({'error': 'No selected file'}), 400
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
+            temp_file_path = temp_file.name
+            file.save(temp_file_path)
+        r = sr.Recognizer()
+        with sr.AudioFile(temp_file_path) as source:
+            audio = r.record(source)
+        os.remove(temp_file_path)
+        return jsonify({'text': r.recognize_google(audio)})
+    except Exception as e:
+        print({'error': f'Voice to text failed: {str(e)}'})
+        return jsonify({'error': f'Voice to text failed: {str(e)}'}), 500
+
 
 @app.route('/settemperature', methods=['POST'])
 def settemperature():
+    global temperature, llm
     data = request.json
     if not data or 'temperature' not in data:
         return jsonify({'error': 'No temperature provided'}), 400
     
-    with state.lock:
-        state.temperature = float(data['temperature'])
-        state.reset_llm()
-    
-    return jsonify({'message': f'Temperature set to {state.temperature}'})
+    temperature = float(data['temperature'])
+    llm = ChatGroq(
+        model_name="llama-3.1-70b-versatile",
+        temperature=temperature,
+        groq_api_key=os.environ["GROQ_API_KEY"]
+    )
+    return jsonify({'message': f'Temperature set to {temperature}'})
+
+@app.route('/send', methods=['GET'])
+def hello():
+    return jsonify({'message': 'Hello, World!'})
 
 @app.route('/query', methods=['POST'])
 def query():
+    global collection_name, client, embeddings, llm
     data = request.json
     if not data or 'question' not in data:
         return jsonify({'error': 'No question provided'}), 400
     
-    if not state.collection_name:
+    if not collection_name:
         return jsonify({'error': 'Collection name not set. Please call /db_collection first'}), 400
     
     try:
+        query = data['question']
+        if len(query) > 1000:
+            error = "Query length should be less than 1000 characters"
+            return jsonify({'error': error}), 400
+        
         chat_history = data.get('history', [])
-        db = state.client[state.db_name]
-        collection = db[state.collection_name]
-
-        # Use smaller retrieval batch size
+        db = client[db_name]
+        collection = db[collection_name]
+        index_name = collection_name + "_vector_index"
+        
         vectorstore = MongoDBAtlasVectorSearch(
             collection=collection,
-            embedding=state.embeddings,
-            index_name="default"
+            embedding=embeddings,
+            index_name=index_name
         )
         
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 3})  # Limit number of retrieved documents
+        retriever = vectorstore.as_retriever()
         qa_chain = RetrievalQA.from_chain_type(
-            llm=state.llm,
+            llm=llm,
             chain_type="stuff",
             retriever=retriever,
             return_source_documents=True
         )
-
-        # Limit chat history to last 5 exchanges
-        recent_history = chat_history[-5:] if len(chat_history) > 5 else chat_history
+        
         formatted_history = "\n".join([
             f"User: {exchange['human']}\nAssistant: {exchange['assistant']}"
-            for exchange in recent_history
+            for exchange in chat_history
         ])
+        context = ""
+        if formatted_history:
+            context = f"Previous conversation:\n{formatted_history}\n\nCurrent question: "
         
-        context = f"Previous conversation:\n{formatted_history}\n\nCurrent question: " if formatted_history else ""
         full_query = context + data['question']
 
         response = qa_chain.invoke({"query": full_query})
-        gc.collect()  # Force garbage collection after query
-        
+        ans = response['result']
+        source_doc = response["source_documents"][0].metadata["source"]
+        ans = ans + f"\n\nSource: {source_doc[5:-4]}"
         return jsonify({
-            'answer': response['result'],
-            'collection': state.collection_name
+            'answer': ans
         })
         
     except Exception as e:
         print({'error': f'Query failed: {str(e)}'})
         return jsonify({
             'error': f'Query failed: {str(e)}',
-            'collection_name': state.collection_name
+            'collection_name': collection_name
         }), 500
+
 
 @app.route('/upload', methods=['POST'])
 def upload():
+    global client, db_name, embeddings, collection_name
     type = int(request.form.get('type', '0'))
     if 'file' not in request.files:
         return jsonify({'error': 'No file part'}), 400
@@ -159,16 +164,36 @@ def upload():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
-    temp_path = os.path.join('/tmp', file.filename)
+    
+    db = client[db_name]
+    temp_file_path = None
+    custom_filename = None
+    
     try:
-        file.save(temp_path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            temp_file_path = temp_file.name
+            file.save(temp_file_path)
+        
+        custom_filename = f"/tmp/{str(file.filename)}.pdf"
+        shutil.copy(temp_file_path, custom_filename)
+        
+       
         collection_name = str(file.filename)
         if collection_name.endswith('.pdf'):
             collection_name = collection_name[:-4]
-
-        db = state.client[state.db_name]
+            
+       
+        loader = UnstructuredPDFLoader(
+            custom_filename,
+            mode="elements",
+            strategy="fast"
+        )
         
-        # Handle collection creation/deletion
+     
+        documents = loader.load()
+        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+        texts = text_splitter.split_documents(documents)
+        
         if type == 0:
             if collection_name in db.list_collection_names():
                 db.drop_collection(collection_name)
@@ -178,32 +203,39 @@ def upload():
                 db.create_collection(collection_name)
         
         collection = db[collection_name]
+        index_name = collection_name + "_vector_index"
         
-        # Create or update index
-        if "vector_index" in collection.list_search_indexes():
-            collection.drop_index("vector_index")
-        collection.create_search_index(
-            {"definition": {
-                "mappings": {"dynamic": True, "fields": {
-                    "embedding": {
-                        "type": "knnVector",
-                        "dimensions": 768,
-                        "similarity": "cosine"
-                    }}}},
-             "name": "default"
-            }
-        )
-
-        # Process PDF in batches
+     
+        if index_name not in [idx["name"] for idx in collection.list_search_indexes()]:
+            collection.create_search_index(
+                {
+                    "definition": {
+                        "mappings": {
+                            "dynamic": True,
+                            "fields": {
+                                "embedding": {
+                                    "type": "knnVector",
+                                    "dimensions": 768,
+                                    "similarity": "cosine"
+                                }
+                            }
+                        }
+                    },
+                    "name": index_name
+                }
+            )
+        
+      
         vectorstore = MongoDBAtlasVectorSearch(
             collection=collection,
-            embedding=state.embeddings,
-            index_name="vector_index"
+            embedding=embeddings,
+            index_name=index_name
         )
-
-        for batch in process_pdf_in_batches(temp_path):
-            vectorstore.add_documents(batch)
-            gc.collect()  # Force garbage collection after each batch
+        vectorstore.add_documents(texts)
+        
+      
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
         
         return jsonify({
             'message': 'File processed successfully',
@@ -212,12 +244,15 @@ def upload():
         
     except Exception as e:
         print({'error': f'Upload failed: {str(e)}'})
-        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+       
+        if collection_name and collection_name in db.list_collection_names():
+            db.drop_collection(collection_name)
     
-    finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        return jsonify({'error': f'Upload failed: {str(e)}'}), 500
+
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 7860))
     app.run(host='0.0.0.0', port=port)
