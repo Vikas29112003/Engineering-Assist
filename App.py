@@ -13,24 +13,26 @@ import nltk
 import speech_recognition as sr
 import shutil
 
+# Before any NLTK imports or operations
+import os
+import nltk
 
+# Set NLTK data path - make sure this happens BEFORE any NLTK operations
 nltk_data_path = "/tmp/nltk_data"
+os.environ["NLTK_DATA"] = nltk_data_path
 os.makedirs(nltk_data_path, exist_ok=True)
-nltk.data.path.append(nltk_data_path)
 
+# Configure NLTK paths - modify this section to be more explicit
+nltk.data.path = [nltk_data_path]  # Replace the paths instead of inserting
 
-try:
-    
-    nltk.download('punkt', download_dir=nltk_data_path, quiet=True)
-    nltk.download('averaged_perceptron_tagger', download_dir=nltk_data_path, quiet=True)
-except Exception as e:
-    print(f"Failed to download NLTK data: {e}")
-
+# Disable tokenizers parallelism
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*", "allow_headers": "*", "expose_headers": "*"}})
-MONGO_URL = os.environ["MONGO_URL"]
+
+# Get MongoDB URL from environment, with a fallback for testing
+MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017/")
 
 collection_name = None
 temperature = 0
@@ -38,6 +40,7 @@ db_name = "User"
 client = MongoClient(MONGO_URL)
 embeddings = HuggingFaceEmbeddings()
 
+# Initialize Groq LLM
 llm = ChatGroq(
     model_name="llama-3.1-70b-versatile",
     temperature=temperature,
@@ -164,32 +167,38 @@ def upload():
     if file.filename == '':
         return jsonify({'error': 'No selected file'}), 400
     
-    
+    # Initialize db at the beginning to avoid UnboundLocalError in except block
     db = client[db_name]
     temp_file_path = None
     custom_filename = None
     
     try:
+        # Save uploaded file to a temporary writable location
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_file_path = temp_file.name
             file.save(temp_file_path)
         
-        custom_filename = f"/tmp/{str(file.filename)}.pdf"
+        # Use a writable path for the custom filename
+        custom_filename = f"/tmp/{file.filename}"
         shutil.copy(temp_file_path, custom_filename)
         
-       
+        # Set collection name before trying to load documents
         collection_name = str(file.filename)
         if collection_name.endswith('.pdf'):
             collection_name = collection_name[:-4]
             
-       
+        # Configure loader to work without NLTK tokenizers
+        # The "fast" strategy relies less on NLTK
         loader = UnstructuredPDFLoader(
             custom_filename,
             mode="elements",
-            strategy="fast"
+            strategy="fast",
+            # Skip NLTK-dependent processing
+            skip_header_footer=True,
+            paragraph_grouper=False
         )
         
-     
+        # Load documents
         documents = loader.load()
         text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
         texts = text_splitter.split_documents(documents)
@@ -205,7 +214,7 @@ def upload():
         collection = db[collection_name]
         index_name = collection_name + "_vector_index"
         
-     
+        # Create search index if it doesn't exist
         if index_name not in [idx["name"] for idx in collection.list_search_indexes()]:
             collection.create_search_index(
                 {
@@ -225,7 +234,7 @@ def upload():
                 }
             )
         
-      
+        # Add documents to vector store
         vectorstore = MongoDBAtlasVectorSearch(
             collection=collection,
             embedding=embeddings,
@@ -233,9 +242,11 @@ def upload():
         )
         vectorstore.add_documents(texts)
         
-      
+        # Clean up temporary files
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+        if custom_filename and os.path.exists(custom_filename):
+            os.remove(custom_filename)
         
         return jsonify({
             'message': 'File processed successfully',
@@ -244,12 +255,14 @@ def upload():
         
     except Exception as e:
         print({'error': f'Upload failed: {str(e)}'})
-       
+        # Only attempt to drop collection if it was created
         if collection_name and collection_name in db.list_collection_names():
             db.drop_collection(collection_name)
-    
+        # Clean up temporary files on error
         if temp_file_path and os.path.exists(temp_file_path):
             os.remove(temp_file_path)
+        if custom_filename and os.path.exists(custom_filename):
+            os.remove(custom_filename)
         return jsonify({'error': f'Upload failed: {str(e)}'}), 500
 
 

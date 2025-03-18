@@ -16,5 +16,8 @@ EXPOSE 7860
 # Define environment variable
 ENV NAME=env
 
+# Add this before your CMD line
+RUN mkdir -p /tmp/nltk_data && chmod 777 /tmp/nltk_data
+
 # Run app.py when the container launches
 CMD ["python", "App.py"]
